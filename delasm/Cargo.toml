@@ -1,0 +1,9 @@
+[package]
+name = "delasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+delevm = { path = "../delevm" }
+nom = "8.0.0"
+nom_locate = "5.0.0"
