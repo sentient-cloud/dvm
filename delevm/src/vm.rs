@@ -675,7 +675,6 @@ impl DeleVM {
 
                 Ok(None)
             }
-
             _ => Err(DeleVMError::InvalidOpcode(opcode)),
         }
     }

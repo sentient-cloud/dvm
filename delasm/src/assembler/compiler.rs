@@ -5,7 +5,7 @@ use crate::assembler::{
     parser::{self, CompareKind, Token},
 };
 
-use delevm::opcodes::Opcode;
+use delevm::{opcodes::Opcode, vm};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CompilerError {
@@ -20,6 +20,22 @@ pub enum CompilerError {
     UnknownLabelAttribute(String),
     NumericLiteralTooLarge(String),
     InvalidNumericLiteral(String),
+}
+
+fn mangle_label(current_section: &String, label_parent: &Option<String>, name: &String) -> String {
+    let mut new_name = String::new();
+
+    new_name.push_str(current_section);
+    new_name.push('$');
+
+    if let Some(parent) = label_parent {
+        new_name.push_str(parent);
+        new_name.push('.');
+    }
+
+    new_name.push_str(name);
+
+    new_name
 }
 
 fn assemble_data_entry(
@@ -83,7 +99,7 @@ fn assemble_data_entry(
                     res.extend_from_slice(&value_bytes[..8]);
                 }
                 parser::LiteralKind::String => {
-                    let mut bytes = literal.as_bytes().to_vec();
+                    let mut bytes = parser::unescape_string(literal).as_bytes().to_vec();
 
                     // pad the string to 8 bytes
                     while bytes.len() % 8 != 0 {
@@ -93,10 +109,10 @@ fn assemble_data_entry(
                     res.extend_from_slice(&bytes);
                 }
                 parser::LiteralKind::Char => {
-                    let ch = match literal.chars().next() {
+                    let ch = match parser::unescape_char(&literal) {
                         Some(c) => c,
                         None => {
-                            return Err(CompilerError::NumericLiteralTooLarge(format!(
+                            return Err(CompilerError::InvalidNumericLiteral(format!(
                                 "[Compilation error] @ {}: Invalid char literal: {}",
                                 loc.stringify(file_map),
                                 literal
@@ -123,37 +139,154 @@ fn assemble_data_entry(
     Ok(res)
 }
 
+fn assemble_immediate(
+    loc: &parser::Location,
+    kind: parser::LiteralKind,
+    literal: &String,
+    file_map: &[String],
+) -> Result<u16, CompilerError> {
+    match kind {
+        parser::LiteralKind::Binary => {
+            if literal.len() > 16 {
+                return Err(CompilerError::NumericLiteralTooLarge(format!(
+                    "[Compilation error] @ {}: Binary immediate too large: {}",
+                    loc.stringify(file_map),
+                    literal
+                )));
+            }
+
+            u16::from_str_radix(literal, 2).map_err(|_| {
+                CompilerError::InvalidNumericLiteral(format!(
+                    "[Compilation error] @ {}: Invalid immediate binary literal: {}",
+                    loc.stringify(file_map),
+                    literal
+                ))
+            })
+        }
+        parser::LiteralKind::Hex => {
+            if literal.len() > 4 {
+                return Err(CompilerError::NumericLiteralTooLarge(format!(
+                    "[Compilation error] @ {}: Hex immediate too large: {}",
+                    loc.stringify(file_map),
+                    literal
+                )));
+            }
+
+            u16::from_str_radix(literal, 16).map_err(|_| {
+                CompilerError::InvalidNumericLiteral(format!(
+                    "[Compilation error] @ {}: Invalid immediate hex literal: {}",
+                    loc.stringify(file_map),
+                    literal
+                ))
+            })
+        }
+        parser::LiteralKind::Decimal => literal.parse::<u16>().map_err(|_| {
+            CompilerError::InvalidNumericLiteral(format!(
+                "[Compilation error] @ {}: Invalid immediate decimal literal: {}",
+                loc.stringify(file_map),
+                literal
+            ))
+        }),
+        parser::LiteralKind::String => {
+            // strings are not valid immediates
+            Err(CompilerError::InvalidOperand(format!(
+                "[Compilation error] @ {}: String literal cannot be used as an immediate",
+                loc.stringify(file_map)
+            )))
+        }
+        parser::LiteralKind::Char => {
+            let ch = match parser::unescape_char(&literal) {
+                Some(c) => c,
+                None => {
+                    return Err(CompilerError::InvalidNumericLiteral(format!(
+                        "[Compilation error] @ {}: Invalid immediate char literal: {}",
+                        loc.stringify(file_map),
+                        literal
+                    )));
+                }
+            };
+
+            Ok(ch as u16)
+        }
+    }
+}
+
+fn assemble_register(
+    loc: &parser::Location,
+    register: Result<vm::Register, usize>,
+    file_map: &[String],
+) -> Result<u8, CompilerError> {
+    match register {
+        Ok(reg) => Ok(reg.to_u8()),
+        Err(index) => {
+            if index < 16 {
+                Ok(index as u8)
+            } else {
+                Err(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: Register index {} is out of bounds (0-15)",
+                    loc.stringify(file_map),
+                    index
+                )))
+            }
+        }
+    }
+}
+
+fn assemble_syscall(
+    log: &parser::Location,
+    syscall: &Result<delevm::Syscall, String>,
+    file_map: &[String],
+) -> Result<u16, CompilerError> {
+    match syscall {
+        Ok(syscall) => Ok(syscall.to_u16()),
+        Err(name) => Err(CompilerError::UnknownSyscall(format!(
+            "[Compilation error] @ {}: Unknown syscall '{}'",
+            log.stringify(file_map),
+            name
+        ))),
+    }
+}
+
 fn assemble_instruction(
     loc: &parser::Location,
     compare_mode: &CompareKind,
+    section_name: &String,
+    label_parent: &Option<String>,
     operands: &Vec<Token>,
     file_map: &[String],
-) -> Result<(Vec<u8>, Vec<object::Relocation>), CompilerError> {
+) -> Result<(Vec<u8>, Vec<object::Relocation>), Vec<CompilerError>> {
+    let mut errors = vec![];
+
     if operands.len() < 1 {
-        return Err(CompilerError::InvalidOperand(format!(
+        errors.push(CompilerError::InvalidOperand(format!(
             "[Compilation error] @ {}: No operands provided for instruction",
             loc.stringify(file_map)
         )));
     }
 
     // first operand is always opcode
+    // (in case of error, default to Nop, which accepts any args)
     let opcode = match &operands[0] {
         Token::Opcode(loc, opcode) => match opcode {
             Ok(opcode) => opcode.clone(),
             Err(str) => {
-                return Err(CompilerError::UnknownInstruction(format!(
+                errors.push(CompilerError::UnknownInstruction(format!(
                     "[Compilation error] @ {}: Unknown instruction '{}'",
                     loc.stringify(file_map),
                     str
                 )));
+
+                Opcode::Nop
             }
         },
         _ => {
-            return Err(CompilerError::InvalidOperand(format!(
-                "[Compilation error] @ {}: Expected opcode, found {:?}",
+            errors.push(CompilerError::InvalidOperand(format!(
+                "[Compilation error] @ {}: Expected opcode token, found {:?}",
                 loc.stringify(file_map),
                 operands[0]
             )));
+
+            Opcode::Nop
         }
     };
 
@@ -175,48 +308,556 @@ fn assemble_instruction(
         };
 
     let mut b = 0u8;
-    let mut c = 0u16;
+    let mut c = 0u8;
+    let mut d = 0u16;
 
     let mut relocations = vec![];
 
     match opcode {
-        Opcode::Nop => {
-            if operands.len() != 0 {
-                return Err(CompilerError::InvalidOperand(format!(
-                    "[Compilation error] @ {}: Nop expects no operands, found {}",
+        // Nop, ignore any operands
+        Opcode::Nop => {}
+
+        // JumpImm and CallImm, both except a label or immediate operand
+        Opcode::JumpImm | Opcode::CallImm => {
+            if operands.len() != 1 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 1 operand, found {}",
                     loc.stringify(file_map),
+                    opcode.to_str(),
                     operands.len()
                 )));
             }
 
+            match &operands[0] {
+                Token::Label(_, (name, _)) => {
+                    relocations.push(object::Relocation {
+                        kind: object::RelocationKind::Absolute,
+                        from_section: section_name.clone(),
+                        to_section: section_name.clone(),
+                        to_symbol: mangle_label(section_name, label_parent, name),
+                        offset: 2,
+                        addend: 0,
+                    });
+
+                    b = 0;
+                    c = 0;
+                    d = 0;
+                }
+                Token::Immediate(_, (kind, value)) => {
+                    match assemble_immediate(loc, kind.clone(), value, file_map) {
+                        Ok(imm) => {
+                            b = 0;
+                            c = 0;
+                            d = imm as u16;
+                        }
+                        Err(err) => {
+                            errors.push(err);
+                        }
+                    }
+                }
+                _ => {
+                    errors.push(CompilerError::InvalidOperand(format!(
+                        "[Compilation error] @ {}: {} expects a label or immediate operand, found {:?}",
+                        loc.stringify(file_map),
+                        opcode.to_str(),
+                        operands[0].to_str(),
+                    )));
+                }
+            }
+        }
+
+        // CallPtr, expects a register
+        Opcode::CallPtr => {
+            if operands.len() != 1 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 1 operand, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match &operands[0] {
+                    Token::Register(_, reg) => {
+                        b = 0;
+                        c = match assemble_register(loc, reg.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        d = 0;
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                            "[Compilation error] @ {}: {} expects a register operand, found {:?}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Ret, no operands
+        Opcode::Return => {
+            if operands.len() != 0 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects no operands, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            }
             b = 0;
             c = 0;
+            d = 0;
         }
-        Opcode::JumpImm => {
+
+        // Abort, expects an immediate operand
+        Opcode::Abort => {
             if operands.len() != 1 {
-                return Err(CompilerError::InvalidOperand(format!(
-                    "[Compilation error] @ {}: JumpImm expects 1 operand, found {}",
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 1 operand, found {}",
                     loc.stringify(file_map),
+                    opcode.to_str(),
                     operands.len()
                 )));
+            } else {
+                match &operands[0] {
+                    Token::Immediate(_, (kind, value)) => {
+                        match assemble_immediate(loc, kind.clone(), value, file_map) {
+                            Ok(imm) => {
+                                b = 0;
+                                c = 0;
+                                d = imm as u16;
+                            }
+                            Err(err) => {
+                                errors.push(err);
+                            }
+                        }
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                            "[Compilation error] @ {}: {} expects an immediate operand, found {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                        )));
+                    }
+                }
             }
         }
-        Opcode::CallImm => {
-            if operands.len() != 1 {
-                return Err(CompilerError::InvalidOperand(format!(
-                    "[Compilation error] @ {}: CallImm expects 1 operand, found {}",
+
+        // Load, USet, UAdd, USub, expects a register and an immediate or label or data addr label
+        Opcode::Load | Opcode::USet | Opcode::UAdd | Opcode::USub => {
+            if operands.len() != 2 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 2 operands, found {}",
                     loc.stringify(file_map),
+                    opcode.to_str(),
                     operands.len()
                 )));
+            } else {
+                match (&operands[0], &operands[1]) {
+                    (Token::Register(_, reg_a), Token::Immediate(_, (kind, value))) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = 0;
+                        match assemble_immediate(loc, kind.clone(), value, file_map) {
+                            Ok(imm) => d = imm as u16,
+                            Err(err) => {
+                                errors.push(err);
+                                d = 0; // default to 0 if error
+                            }
+                        };
+                    }
+                    (Token::Register(_, reg_a), Token::Label(_, (name, _))) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = 0;
+                        relocations.push(object::Relocation {
+                            kind: object::RelocationKind::Absolute,
+                            from_section: section_name.clone(),
+                            to_section: section_name.clone(),
+                            to_symbol: mangle_label(section_name, label_parent, name),
+                            offset: 2,
+                            addend: 0,
+                        });
+                    }
+                    (Token::Register(_, reg_a), Token::DataAddrLabel(_, (section, name))) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = 0;
+                        relocations.push(object::Relocation {
+                            kind: object::RelocationKind::Absolute,
+                            from_section: section_name.clone(),
+                            to_section: section.clone(),
+                            to_symbol: mangle_label(section_name, label_parent, name),
+                            offset: 2,
+                            addend: 0,
+                        });
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                        "[Compilation error] @ {}: {} expects a register and an immediate or label or data label operand, found {} and {}",
+                        loc.stringify(file_map),
+                        opcode.to_str(),
+                        operands[0].to_str(),
+                        operands[1].to_str(),
+                    )));
+                    }
+                }
             }
         }
-        _ => println!(
-            "Unimplemented assemble: opcode {:?} with compare mode {:?}",
-            opcode, compare_mode
-        ),
+
+        // Push and Pop, expects a register
+        Opcode::Push | Opcode::Pop => {
+            if operands.len() != 1 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 1 operand, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match &operands[0] {
+                    Token::Register(_, reg) => {
+                        b = match assemble_register(loc, reg.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = 0;
+                        d = 0;
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                            "[Compilation error] @ {}: {} expects a register operand, found {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Move, Peek, StorePtr, LoadPtr, Not, CvtI2F, CvtF2I
+        // expects two registers
+        Opcode::Move
+        | Opcode::Peek
+        | Opcode::StorePtr
+        | Opcode::LoadPtr
+        | Opcode::Not
+        | Opcode::CvtI2F
+        | Opcode::CvtF2I => {
+            if operands.len() != 2 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 2 operands, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match (&operands[0], &operands[1]) {
+                    (Token::Register(_, reg_a), Token::Register(_, reg_b)) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = match assemble_register(loc, reg_b.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        d = 0;
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                        "[Compilation error] @ {}: {} expects two register operands, found {} and {}",
+                        loc.stringify(file_map),
+                        opcode.to_str(),
+                        operands[0].to_str(),
+                        operands[1].to_str(),
+                    )));
+                    }
+                }
+            }
+        }
+
+        // And, Or, Xor, ShiftL, ShiftR, IAdd, ISub, IMul, IDiv, IRem, FAdd, FSub, FMul, FDiv, FRem
+        // expects three registers
+        Opcode::And
+        | Opcode::Or
+        | Opcode::Xor
+        | Opcode::ShiftL
+        | Opcode::ShiftR
+        | Opcode::IAdd
+        | Opcode::ISub
+        | Opcode::IMul
+        | Opcode::IDiv
+        | Opcode::IRem
+        | Opcode::FAdd
+        | Opcode::FSub
+        | Opcode::FMul
+        | Opcode::FDiv
+        | Opcode::FRem => {
+            if operands.len() != 3 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 3 operands, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match (&operands[0], &operands[1], &operands[2]) {
+                    (
+                        Token::Register(_, reg_a),
+                        Token::Register(_, reg_b),
+                        Token::Register(_, reg_c),
+                    ) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = match assemble_register(loc, reg_b.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        d = match assemble_register(loc, reg_c.clone(), file_map) {
+                            Ok(reg) => reg as u16,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                        "[Compilation error] @ {}: {} expects three register operands, found {:?}, {:?} and {:?}",
+                        loc.stringify(file_map),
+                        opcode.to_str(),
+                        operands[0],
+                        operands[1],
+                        operands[2]
+                    )));
+                    }
+                }
+            }
+        }
+
+        // ILess, IEqual, IGreater, FLess, FEqual, FGreater expects two registers (2nd reg placed in d)
+        Opcode::ILess
+        | Opcode::IEqual
+        | Opcode::IGreater
+        | Opcode::FLess
+        | Opcode::FEqual
+        | Opcode::FGreater => {
+            if operands.len() != 2 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 2 operands, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match (&operands[0], &operands[1]) {
+                    (Token::Register(_, reg_a), Token::Register(_, reg_b)) => {
+                        c = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        d = match assemble_register(loc, reg_b.clone(), file_map) {
+                            Ok(reg) => reg as u16,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                        "[Compilation error] @ {}: {} expects two register operands, found {} and {}",
+                        loc.stringify(file_map),
+                        opcode.to_str(),
+                        operands[0].to_str(),
+                        operands[1].to_str(),
+                    )));
+                    }
+                }
+            }
+        }
+
+        // FEpsilon, expects a single register placed in c
+        Opcode::FEpsilon => {
+            if operands.len() != 1 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 1 operand, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match &operands[0] {
+                    Token::Register(_, reg) => {
+                        b = 0;
+                        c = match assemble_register(loc, reg.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        d = 0;
+                    }
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                            "[Compilation error] @ {}: {} expects a register operand, found {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Syscall, expects two registers and a syscall identifier or immediate
+        Opcode::Syscall => {
+            if operands.len() != 3 {
+                errors.push(CompilerError::InvalidOperand(format!(
+                    "[Compilation error] @ {}: {} expects 3 operands, found {}",
+                    loc.stringify(file_map),
+                    opcode.to_str(),
+                    operands.len()
+                )));
+            } else {
+                match (&operands[0], &operands[1], &operands[2]) {
+                    (
+                        Token::Register(_, reg_a),
+                        Token::Register(_, reg_b),
+                        Token::Immediate(_, (kind, value)),
+                    ) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = match assemble_register(loc, reg_b.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        match assemble_immediate(loc, kind.clone(), value, file_map) {
+                            Ok(imm) => d = imm as u16,
+                            Err(err) => {
+                                errors.push(err);
+                                d = 0; // default to 0 if error
+                            }
+                        };
+                    }
+                    (
+                        Token::Register(_, reg_a),
+                        Token::Register(_, reg_b),
+                        Token::Syscall(_, syscall),
+                    ) => {
+                        b = match assemble_register(loc, reg_a.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        c = match assemble_register(loc, reg_b.clone(), file_map) {
+                            Ok(reg) => reg,
+                            Err(err) => {
+                                errors.push(err);
+                                0 // default to 0 if error
+                            }
+                        };
+                        match assemble_syscall(loc, &syscall, file_map) {
+                            Ok(syscall_id) => d = syscall_id,
+                            Err(err) => {
+                                errors.push(err);
+                                d = 0; // default to 0 if error
+                            }
+                        };
+                    }
+
+                    _ => {
+                        errors.push(CompilerError::InvalidOperand(format!(
+                            "[Compilation error] @ {}: {} expects two registers and a syscall identifier or immediate, found {}, {} and {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                            operands[1].to_str(),
+                            operands[2].to_str(),
+                        )));
+                    }
+                }
+            }
+        }
     }
 
-    Ok((vec![a, b, (c >> 8) as u8, (c & 0xFF) as u8], relocations))
+    if errors.len() > 0 {
+        return Err(errors);
+    }
+
+    assert!(b < 16, "expected b to only use lower 4 bits, got {}", b);
+    assert!(c < 16, "expected c to only use lower 4 bits, got {}", c);
+
+    // encode instruction as:
+    // 0: a[2 compare bits + 6 bit opcode]
+    // 1: lower 4 bits of b placed in the upper 4 bits,
+    //    lower 4 bits of c placed in the lower 4 bits
+    // 2: upper 8 bits of d
+    // 3: lower 8 bits of d
+    Ok((
+        vec![
+            a,
+            (b << 4) | (c & 0xF),
+            ((d >> 8) & 0xFF) as u8,
+            (d & 0xFF) as u8,
+        ],
+        relocations,
+    ))
 }
 
 pub fn compile_tokens(
@@ -393,19 +1034,7 @@ pub fn compile_tokens(
                     } else {
                         // else prefix with the section name and parent label if any
                         // (section$parent.label)
-                        let mut new_name = String::new();
-
-                        new_name.push_str(current_section);
-                        new_name.push('$');
-
-                        if let Some(ref parent) = current_label_parent {
-                            new_name.push_str(parent);
-                            new_name.push('.');
-                        }
-
-                        new_name.push_str(name);
-
-                        new_name
+                        mangle_label(current_section, &current_label_parent, name)
                     };
 
                     // check if the label already exists
@@ -526,17 +1155,28 @@ pub fn compile_tokens(
                     match assemble_instruction(
                         loc,
                         &compare_kind_stack.last().unwrap().0,
+                        &current_section.as_ref().unwrap(),
+                        &current_label_parent,
                         operands,
                         file_map,
                     ) {
                         Ok((assembled, relocs)) => {
-                            relocations.extend(relocs);
+                            // push the relocations, setting their section, and updating the offset
+                            // (offset is currently relative to the instruction)
+                            relocations.extend(relocs.iter().map(|reloc| object::Relocation {
+                                from_section: reloc.from_section.clone(),
+                                to_section: reloc.to_section.clone(),
+                                to_symbol: reloc.to_symbol.clone(),
+                                kind: reloc.kind.clone(),
+                                offset: current_offset as u64 + reloc.offset as u64,
+                                addend: reloc.addend,
+                            }));
 
                             current_offset += assembled.len();
                             section.data.extend(assembled);
                         }
-                        Err(err) => {
-                            errors.push(err);
+                        Err(errs) => {
+                            errors.extend(errs);
                         }
                     }
                 } else {
@@ -547,7 +1187,7 @@ pub fn compile_tokens(
                 }
             }
 
-            _ => {}
+            _ => todo!(),
         }
     }
 
@@ -583,21 +1223,18 @@ $code
             pop R0                    ; restore R0
         ]
         iadd R1, R0, R1               ; add 1 to R1
-        iequ R3, R1, R4               ; if R1 == 1000
+        iequ R1, R4                   ; if R1 == 1000
         @t [
-            syscall R0, meow[.D0], print_string
-            call .lib_function
+            uset R1, meow[.D0]            ; set R1 to addr of the string
+            syscall R0, R1, print_string  ; print it
+            call .lib_function            ; call a library function
             abort #0x0000
         ]
         jump .L0
 
 $code(library)
 .lib_function(export):
-    @t [
-        "abcdef"
-        @f ret
-    ]
-    
+    ret
 
 $data
 .D0:    0b01 ; increment size
@@ -611,13 +1248,15 @@ $data(meow) @ 0x1000
 "#;
         let (tokens, file_map) = parser::tokenize("file".to_string(), &src.to_string());
 
-        println!("{:?}", file_map);
+        println!("{}", src);
+
         println!("{}", parser::stringify_tokens(&tokens, &file_map));
 
         let result = compile_tokens(&tokens, &file_map);
 
         match result {
             Ok(object) => {
+                println!("Compilation success");
                 println!("{:#?}", object);
             }
             Err(errors) => {

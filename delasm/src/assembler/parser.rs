@@ -187,7 +187,7 @@ fn parse_string(input: Span) -> IResult<Span, Span> {
     Ok((input, s))
 }
 
-fn unescape_string(input: &str) -> String {
+pub fn unescape_string(input: &str) -> String {
     let mut result = String::new();
     let mut chars = input.chars().peekable();
 
@@ -257,7 +257,7 @@ fn unescape_string(input: &str) -> String {
     result
 }
 
-fn unescape_char(input: &str) -> Option<char> {
+pub fn unescape_char(input: &str) -> Option<char> {
     if input.len() == 1 {
         return Some(input.chars().next().unwrap());
     }

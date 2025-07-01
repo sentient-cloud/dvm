@@ -52,18 +52,24 @@ relocations chunk: (align 8)
     type (1 byte, u8)
         1: absolute
         2: relative
-    section (variable length ascii string, zero terminated)
-        (the section name to apply the relocation to)
+    from_section (variable length ascii string, zero terminated)
+        (section the relocation is in)
+    to_section (variable length ascii string, zero terminated)
+        (section the relocation refers to, can be the same as from_section)
+    to_symbol (variable length ascii string, zero terminated)
+        (symbol the relocation refers to)
     offset (8 bytes, u64, align 8)
         (address of the relocation relative to the start of the section)
     addend (8 bytes, i64, align 8)
+        (addend to the symbol address, can be negative)
 
     (repeated until the end of the chunk)
 
     // absolute relocations:
-    //     1. look up symbol by the name
-    //     2. compute relocation address as symbol address + addend
-    //     3. write the address to the offset
+    //     1. look up the symbol:
+    //        if not found, strip off parent label
+    //        if still not found, strip off section name
+    //     2.
 
 section chunk: (align 8)
     type (4 bytes, u32)
@@ -215,7 +221,9 @@ impl RelocationKind {
 #[derive(Debug, Clone)]
 pub struct Relocation {
     pub kind: RelocationKind,
-    pub section: String,
+    pub from_section: String,
+    pub to_section: String,
+    pub to_symbol: String,
     pub offset: u64,
     pub addend: i64,
 }
@@ -537,12 +545,30 @@ impl Object {
                                 relocation_kind_byte
                             )))?;
 
-                        let (section_name, rest) = chop_stringz(rest)?;
-                        let section_name =
-                            String::from_utf8(section_name.to_vec()).map_err(|_| {
+                        let (from_section_name, rest) = chop_stringz(rest)?;
+                        let from_section_name = String::from_utf8(from_section_name.to_vec())
+                            .map_err(|_| {
+                                ObjectError::InvalidSymbolName(format!(
+                                    "Invalid section name in relocation: {:?}",
+                                    from_section_name
+                                ))
+                            })?;
+
+                        let (to_section_name, rest) = chop_stringz(rest)?;
+                        let to_section_name =
+                            String::from_utf8(to_section_name.to_vec()).map_err(|_| {
+                                ObjectError::InvalidSymbolName(format!(
+                                    "Invalid section name in relocation: {:?}",
+                                    to_section_name
+                                ))
+                            })?;
+
+                        let (to_symbol_name, rest) = chop_stringz(rest)?;
+                        let to_symbol_name =
+                            String::from_utf8(to_symbol_name.to_vec()).map_err(|_| {
                                 ObjectError::InvalidSymbolName(format!(
                                     "Invalid symbol name in relocation: {:?}",
-                                    section_name
+                                    to_symbol_name
                                 ))
                             })?;
 
@@ -556,7 +582,9 @@ impl Object {
 
                         res.relocations.push(Relocation {
                             kind: relocation_kind,
-                            section: section_name,
+                            from_section: from_section_name,
+                            to_section: to_section_name,
+                            to_symbol: to_symbol_name,
                             offset,
                             addend,
                         });
