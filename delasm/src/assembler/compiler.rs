@@ -515,13 +515,14 @@ fn assemble_instruction(
                         });
                     }
                     _ => {
+                        #[rustfmt::skip]
                         errors.push(CompilerError::InvalidOperand(format!(
-                        "[Compilation error] @ {}: {} expects a register and an immediate or label or data label operand, found {} and {}",
-                        loc.stringify(file_map),
-                        opcode.to_str(),
-                        operands[0].to_str(),
-                        operands[1].to_str(),
-                    )));
+                            "[Compilation error] @ {}: {} expects a register and an immediate or label or data label operand, found {} and {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                            operands[1].to_str(),
+                        )));
                     }
                 }
             }
