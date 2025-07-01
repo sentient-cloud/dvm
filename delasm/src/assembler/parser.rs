@@ -6,7 +6,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{escaped, tag, take_while};
 use nom::character::complete::{alphanumeric1, char, digit1, one_of};
 use nom::combinator::opt;
-use nom::multi::{many1, separated_list1};
+use nom::multi::{many1, separated_list0, separated_list1};
 use nom::sequence::{delimited, preceded};
 use nom::{IResult, Parser};
 use nom_locate::LocatedSpan;
@@ -23,7 +23,7 @@ impl Location {
         let file_name = if self.file < file_map.len() {
             &file_map[self.file]
         } else {
-            "%anonymous%"
+            "%unknown%"
         };
         format!("{}:{}:{}", file_name, self.line, self.column)
     }
@@ -44,8 +44,9 @@ pub enum LiteralKind {
     Char,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CompareKind {
+    None, // None is only used by the compiler, and is never constructed by the parser
     True,
     False,
     Maybe,
@@ -53,6 +54,12 @@ pub enum CompareKind {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LabelAttribute {
+    // label parents have "sub-labels", which are labels that are defined within
+    // the parent label's scope, so that multiple functions can share the same label names
+    // note: this label cannot be set explicitly in syntax, its
+    // added if the label has an attribute list with 0 or more fields
+    LabelParent,
+    // label should be exported
     Export,
 }
 
@@ -128,7 +135,7 @@ define_tokens! {
     Error(Location, ErrorToken) = 1,
     Comment(Location, String) = 2,
     Include(Location, String) = 3,
-    Section(Location, (Option<String>, SectionKind)) = 4,
+    Section(Location, (Option<String>, Option<usize>, SectionKind)) = 4,
     Label(Location, (String, Vec<Result<LabelAttribute, String>>)) = 5,
     SectionAddr(Location, usize) = 6,
     Literal(Location, LiteralKind, String) = 7,
@@ -366,6 +373,25 @@ fn parse_section(file: usize, line: usize, input: Span) -> IResult<Span, Token> 
 
     let section_name = section_name.map(|name| name.iter().collect::<String>());
 
+    let (input, pinned_addr) = opt(preceded(
+        delimited(skip_whitespace, char('@'), skip_whitespace),
+        |i| parse_hex_literal(i, Some(4)),
+    ))
+    .parse(input)?;
+
+    let pinned_addr = match pinned_addr {
+        Some((_, addr)) => match usize::from_str_radix(&addr.fragment(), 16) {
+            Ok(addr_value) => Some(addr_value),
+            Err(_) => {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    input,
+                    nom::error::ErrorKind::Digit,
+                )));
+            }
+        },
+        None => None,
+    };
+
     let location = Location {
         file,
         line,
@@ -380,7 +406,7 @@ fn parse_section(file: usize, line: usize, input: Span) -> IResult<Span, Token> 
 
     Ok((
         input,
-        Token::Section(location, (section_name, section_kind)),
+        Token::Section(location, (section_name, pinned_addr, section_kind)),
     ))
 }
 
@@ -395,7 +421,7 @@ fn parse_label_line(file: usize, line: usize, input: Span) -> IResult<Span, Toke
 
     let (input, attributes) = opt(delimited(
         char('('),
-        separated_list1(
+        separated_list0(
             delimited(skip_whitespace, char(','), skip_whitespace),
             alphanumeric1,
         ),
@@ -403,7 +429,9 @@ fn parse_label_line(file: usize, line: usize, input: Span) -> IResult<Span, Toke
     ))
     .parse(input)?;
 
-    let attributes = attributes.map_or(vec![], |attrs| {
+    let has_attrib_list = attributes.is_some();
+
+    let mut attributes = attributes.map_or(vec![], |attrs| {
         attrs
             .iter()
             .map(|attr| match *attr.fragment() {
@@ -412,6 +440,10 @@ fn parse_label_line(file: usize, line: usize, input: Span) -> IResult<Span, Toke
             })
             .collect::<Vec<_>>()
     });
+
+    if has_attrib_list {
+        attributes.push(Ok(LabelAttribute::LabelParent));
+    }
 
     let (input, _) = char(':')(input)?;
 
@@ -518,12 +550,14 @@ fn parse_char_literal(input: Span) -> IResult<Span, (LiteralKind, Span)> {
 
 fn parse_section_addr(file: usize, line: usize, input: Span) -> IResult<Span, Token> {
     let (input, _) = skip_whitespace(input)?;
+    let (input, location) = tag("@")(input)?;
+    let (input, _) = skip_whitespace(input)?;
     let (input, (_, addr)) = parse_hex_literal(input, Some(4))?;
 
     let location = Location {
         file,
         line,
-        column: addr.get_utf8_column() - 2,
+        column: location.get_utf8_column(),
     };
 
     match usize::from_str_radix(&addr.fragment(), 16) {
@@ -899,7 +933,7 @@ fn parse_instruction_line(
 
     let (input, opcode) = parse_opcode_name(file, line, input)?;
 
-    let (input, args) = separated_list1(
+    let (input, args) = separated_list0(
         delimited(skip_whitespace, char(','), skip_whitespace),
         alt((
             |i| parse_data_addr_register_arg(file, line, i),
@@ -915,11 +949,11 @@ fn parse_instruction_line(
 
     let mut instruction_tokens = Vec::new();
 
+    instruction_tokens.push(opcode);
+
     if let Some(cmp) = cmp_flag {
         instruction_tokens.push(cmp);
     }
-
-    instruction_tokens.push(opcode);
 
     instruction_tokens.extend(args);
 
@@ -969,7 +1003,7 @@ fn tokenize_impl(
             continue; // skip empty lines
         }
 
-        println!("{}", line);
+        // println!("{}", line);
 
         let span = Span::new(line);
 
@@ -1167,6 +1201,25 @@ fn tokenize_impl(
             continue;
         }
 
+        if let Ok((span, addr)) = parse_section_addr(file, current_location.line, span) {
+            tokens.push(addr);
+
+            if let Ok((_, token)) = parse_comment(file, current_location.line, span) {
+                tokens.push(token);
+            } else if span.trim_end().len() != 0 {
+                tokens.push(Token::Error(
+                    Location {
+                        file: current_location.file,
+                        line: current_location.line,
+                        column: current_location.column + span.location_offset(),
+                    },
+                    ErrorToken::StrayCharacters(span.fragment().to_string()),
+                ));
+            }
+
+            continue;
+        }
+
         if let Ok((_, token)) = parse_comment(file, current_location.line, span) {
             tokens.push(token);
             continue;
@@ -1224,7 +1277,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
             Token::Include(_, path) => {
                 parts.push(format!("Include: $include \"{}\"\n", path));
             }
-            Token::Section(_, (name, kind)) => {
+            Token::Section(_, (name, fixed_addr, kind)) => {
                 let section_str = match kind {
                     SectionKind::Code => "$code".to_string(),
                     SectionKind::Data => "$data".to_string(),
@@ -1232,10 +1285,14 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                 parts.push(format!("Section: {}", section_str));
 
                 if let Some(name) = name {
-                    parts.push(format!(" ({})\n", name));
-                } else {
-                    parts.push("\n".to_string());
+                    parts.push(format!(" ({})", name));
                 }
+
+                if let Some(addr) = fixed_addr {
+                    parts.push(format!(" @ 0x{:04X}", addr));
+                }
+
+                parts.push("\n".to_string());
             }
             Token::Label(_, (name, attrs)) => {
                 parts.push(format!("Label: .{} ({:?}):\n", name, attrs));
@@ -1274,6 +1331,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
             }
             Token::CompareBlockBegin(_, kind) => {
                 let kind_str = match kind {
+                    CompareKind::None => unreachable!(),
                     CompareKind::True => "t",
                     CompareKind::False => "f",
                     CompareKind::Maybe => "m",
@@ -1289,6 +1347,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                     .map(|arg| {
                         match arg {
                             Token::Compare(_, kind) => format!("{}", match kind {
+                                CompareKind::None => unreachable!(),
                                 CompareKind::True => "@t",
                                 CompareKind::False => "@f",
                                 CompareKind::Maybe => "@m",
@@ -1373,16 +1432,24 @@ $include "file_with_\"cursed\"_name.dasm"
         iequ R3, R1, R4               ; if R1 == 1000
         @t [
             syscall R0, meow[.D0], print_string
+            call .lib_function
             abort #0x0000
         ]
         jump .L0
 
-$data  
-.D0:    1
-.D1:    1000
+$code(library)
+.lib_function(export):
+    "abcdef"
+    ret
 
-$data(meow)
+$data
+.D0:    0b01 ; increment size
+.D1:    1000 ; iteration limit
+
+; a section named meow, at pinned addr 0x1000
+$data(meow) @ 0x1000
 .D0:    "meowmeowmeow\x21\0"
+@0x0004 0xfacefeeddeadbeef
 "#;
 
         let (tokens, file_map) = tokenize("file".to_string(), &src.to_string());

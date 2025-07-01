@@ -52,10 +52,10 @@ relocations chunk: (align 8)
     type (1 byte, u8)
         1: absolute
         2: relative
-    symbol (variable length ascii string, zero terminated)
-        (the symbol name to apply the relocation to)
+    section (variable length ascii string, zero terminated)
+        (the section name to apply the relocation to)
     offset (8 bytes, u64, align 8)
-        (address of the relocation relative to the start of the symbol)
+        (address of the relocation relative to the start of the section)
     addend (8 bytes, i64, align 8)
 
     (repeated until the end of the chunk)
@@ -180,7 +180,7 @@ impl SymbolLinkage {
 
 #[derive(Debug, Clone)]
 pub struct Symbol {
-    pub symbol_kind: SymbolKind,
+    pub kind: SymbolKind,
     pub linkage: SymbolLinkage,
     pub offset: u64,
     pub section_name: Option<String>,
@@ -214,8 +214,8 @@ impl RelocationKind {
 
 #[derive(Debug, Clone)]
 pub struct Relocation {
-    pub relocation_kind: RelocationKind,
-    pub symbol: String,
+    pub kind: RelocationKind,
+    pub section: String,
     pub offset: u64,
     pub addend: i64,
 }
@@ -247,9 +247,9 @@ impl SectionKind {
 
 #[derive(Debug, Clone)]
 pub struct Section {
-    pub section_kind: SectionKind,
+    pub kind: SectionKind,
     pub address: u16,
-    pub name: String,
+    pub name: Option<String>,
     pub data: Vec<u8>,
 }
 
@@ -511,7 +511,7 @@ impl Object {
                         };
 
                         res.symbols.push(Symbol {
-                            symbol_kind,
+                            kind: symbol_kind,
                             linkage: symbol_linkage,
                             offset,
                             section_name,
@@ -537,12 +537,12 @@ impl Object {
                                 relocation_kind_byte
                             )))?;
 
-                        let (symbol_name, rest) = chop_stringz(rest)?;
-                        let symbol_name =
-                            String::from_utf8(symbol_name.to_vec()).map_err(|_| {
+                        let (section_name, rest) = chop_stringz(rest)?;
+                        let section_name =
+                            String::from_utf8(section_name.to_vec()).map_err(|_| {
                                 ObjectError::InvalidSymbolName(format!(
                                     "Invalid symbol name in relocation: {:?}",
-                                    symbol_name
+                                    section_name
                                 ))
                             })?;
 
@@ -555,8 +555,8 @@ impl Object {
                         let addend = i64::from_le_bytes(addend_bytes.try_into().unwrap());
 
                         res.relocations.push(Relocation {
-                            relocation_kind,
-                            symbol: symbol_name,
+                            kind: relocation_kind,
+                            section: section_name,
                             offset,
                             addend,
                         });
@@ -587,13 +587,20 @@ impl Object {
                         let rest = align_slice(data, rest, 4)?;
 
                         let (section_name, rest) = chop_stringz(rest)?;
-                        let section_name =
+                        let mut section_name =
                             String::from_utf8(section_name.to_vec()).map_err(|_| {
                                 ObjectError::InvalidSectionName(format!(
                                     "Invalid section name in section: {:?}",
                                     section_name
                                 ))
                             })?;
+
+                        if section_name.is_empty() {
+                            match section_kind {
+                                SectionKind::Code => section_name = "code".to_string(),
+                                SectionKind::Data => section_name = "data".to_string(),
+                            }
+                        }
 
                         let rest = align_slice(data, rest, 8)?;
 
@@ -610,9 +617,9 @@ impl Object {
                         let (data, rest) = chop(rest, data_size)?;
 
                         res.sections.push(Section {
-                            section_kind,
+                            kind: section_kind,
                             address,
-                            name: section_name,
+                            name: Some(section_name),
                             data: data.to_vec(),
                         });
 
