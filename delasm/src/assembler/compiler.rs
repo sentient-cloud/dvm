@@ -509,7 +509,7 @@ fn assemble_instruction(
                             kind: object::RelocationKind::Absolute,
                             from_section: section_name.clone(),
                             to_section: section.clone(),
-                            to_symbol: mangle_label(section_name, label_parent, name),
+                            to_symbol: mangle_label(section, &None, name),
                             offset: 2,
                             addend: 0,
                         });
@@ -710,12 +710,12 @@ fn assemble_instruction(
                     }
                     _ => {
                         errors.push(CompilerError::InvalidOperand(format!(
-                        "[Compilation error] @ {}: {} expects two register operands, found {} and {}",
-                        loc.stringify(file_map),
-                        opcode.to_str(),
-                        operands[0].to_str(),
-                        operands[1].to_str(),
-                    )));
+                            "[Compilation error] @ {}: {} expects two register operands, found {} and {}",
+                            loc.stringify(file_map),
+                            opcode.to_str(),
+                            operands[0].to_str(),
+                            operands[1].to_str(),
+                        )));
                     }
                 }
             }
