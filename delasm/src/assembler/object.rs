@@ -91,6 +91,21 @@ pub struct Header {
     pub flags: u64,
 }
 
+/// Debug information present
+pub const OBJECT_FLAG_DEBUG: u64 = 1 << 0;
+
+/// Object contains code
+pub const OBJECT_FLAG_CODE: u64 = 1 << 1;
+
+/// Object contains data
+pub const OBJECT_FLAG_DATA: u64 = 1 << 2;
+
+/// Object is a library (not executable, no main symbol)
+pub const OBJECT_FLAG_LIBRARY: u64 = 1 << 3;
+
+/// Object is executable (contains a code section and a main symbol)
+pub const OBJECT_FLAG_EXECUTABLE: u64 = 1 << 4;
+
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
@@ -158,7 +173,6 @@ impl SymbolKind {
 pub enum SymbolLinkage {
     Internal = 1, // In this object file, not exported
     Export = 2,   // In this object file, exported
-    External = 3, // Not in this object file
 }
 
 impl SymbolLinkage {
@@ -170,15 +184,10 @@ impl SymbolLinkage {
         self == SymbolLinkage::Export
     }
 
-    pub fn is_external(self) -> bool {
-        self == SymbolLinkage::External
-    }
-
     pub fn from_u8(value: u8) -> Option<Self> {
         match value {
             1 => Some(SymbolLinkage::Internal),
             2 => Some(SymbolLinkage::Export),
-            3 => Some(SymbolLinkage::External),
             _ => None,
         }
     }
