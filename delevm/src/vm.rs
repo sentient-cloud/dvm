@@ -34,6 +34,7 @@ impl From<u8> for CompareFlag {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleVMError {
     InvalidOpcode(u8),
     InvalidRegister(usize),
@@ -143,18 +144,18 @@ pub const COMPARISON_REG: usize = Register::RCM as usize;
 pub const EPSILON_REG: usize = Register::REP as usize;
 
 pub struct DeleVM {
-    pub data: [Value; 65536],
-    pub code: [u32; 65536],
-    pub stack: [Value; 65536],
+    pub data: Box<[Value; 65536]>,
+    pub code: Box<[u32; 65536]>,
+    pub stack: Box<[Value; 65536]>,
     pub registers: [Value; 16],
 }
 
 impl DeleVM {
     pub fn new() -> Self {
         DeleVM {
-            data: [Value { int64: 0 }; 65536],
-            code: [0; 65536],
-            stack: [Value { int64: 0 }; 65536],
+            data: Box::new([Value { int64: 0 }; 65536]),
+            code: Box::new([0; 65536]),
+            stack: Box::new([Value { int64: 0 }; 65536]),
             registers: [Value { int64: 0 }; 16],
         }
     }
@@ -324,6 +325,18 @@ impl DeleVM {
         b: u8,
         c: u16,
     ) -> Result<Option<Value>, DeleVMError> {
+        #[cfg(debug_assertions)]
+        {
+            println!(
+                "[VM] Executing opcode: {:02X} {:?} (a: {}, b: {}, c: {})",
+                opcode,
+                Opcode::from_u8(opcode),
+                a,
+                b,
+                c
+            );
+        }
+
         match Opcode::from_u8(opcode) {
             Some(Opcode::JumpImm) => {
                 self.write_reg_i64(INSTRUCTION_REG, c as i64)?;
@@ -695,7 +708,7 @@ impl DeleVM {
 
         let a = (instruction >> 20) & 0b1111;
         let b = (instruction >> 16) & 0b1111;
-        let c = (instruction >> 8) & 0b1111_1111_1111_111;
+        let c = (instruction) & 0b1111_1111_1111_1111;
 
         if matches!(cmp, CompareFlag::Maybe) {
             // todo: maybe probability flag

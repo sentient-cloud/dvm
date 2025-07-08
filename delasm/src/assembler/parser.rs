@@ -40,6 +40,7 @@ pub enum LiteralKind {
     Hex,
     Binary,
     Decimal,
+    Float,
     String,
     Char,
 }
@@ -456,13 +457,27 @@ fn parse_label_line(file: usize, line: usize, input: Span) -> IResult<Span, Toke
     Ok((input, Token::Label(location, (name, attributes))))
 }
 
-// parses a decimal literal, which is a sequence of base10 digits
+// parses a decimal literal, which is an optional sign and a sequence of base10 digits
 fn parse_decimal_literal(input: Span) -> IResult<Span, (LiteralKind, Span)> {
     let (input, _) = skip_whitespace(input)?;
 
-    let (input, num) = digit1(input)?;
+    let old_input = input;
+    let (input, _) = opt(alt((char('+'), char('-')))).and(digit1).parse(input)?;
 
-    if num.fragment().chars().all(|c| c.is_digit(10)) {
+    let num = unsafe {
+        Span::new_from_raw_offset(
+            old_input.location_offset(),
+            old_input.location_line(),
+            &old_input[..(input.location_offset() - old_input.location_offset())],
+            (),
+        )
+    };
+
+    if num
+        .fragment()
+        .chars()
+        .all(|c| c.is_digit(10) || c == '+' || c == '-')
+    {
         Ok((input, (LiteralKind::Decimal, num)))
     } else {
         Err(nom::Err::Error(nom::error::Error::new(
@@ -514,6 +529,48 @@ fn parse_hex_literal(input: Span, length: Option<usize>) -> IResult<Span, (Liter
             input,
             nom::error::ErrorKind::Digit,
         )))
+    }
+}
+
+fn parse_float_literal(input: Span) -> IResult<Span, (LiteralKind, Span)> {
+    let (input, _) = skip_whitespace(input)?;
+
+    let old_input = input;
+    let (input, _) = alt((
+        delimited(
+            preceded(opt(alt((char('+'), char('-')))), opt(digit1)),
+            char('.'),
+            opt(preceded(
+                opt(digit1),
+                opt((
+                    preceded(
+                        alt((char('e'), char('E'))),
+                        opt(alt((char('+'), char('-')))),
+                    ),
+                    digit1,
+                )),
+            )),
+        ),
+        // needs to return same type as above, so use '\0' as placeholder
+        // we dont care about the returned span anyways
+        preceded(opt(alt((char('+'), char('-')))), tag("NaN").map(|_| '\0')),
+    ))
+    .parse(input)?;
+
+    // nom sucks
+    let val = &old_input[..(input.location_offset() - old_input.location_offset())];
+
+    match val.parse::<f64>() {
+        Ok(_) => Ok((
+            input,
+            (LiteralKind::Float, unsafe {
+                Span::new_from_raw_offset(old_input.location_offset(), 1, val, ())
+            }),
+        )),
+        Err(_) => Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Float,
+        ))),
     }
 }
 
@@ -615,6 +672,7 @@ fn parse_data_entry(file: usize, line: usize, input: Span) -> IResult<Span, Toke
         alt((
             |i| parse_hex_literal(i, None),
             |i| parse_binary_literal(i, None),
+            |i| parse_float_literal(i),
             |i| parse_decimal_literal(i),
             |i| parse_string_literal(i, None),
             |i| parse_char_literal(i),
@@ -639,6 +697,15 @@ fn parse_data_entry(file: usize, line: usize, input: Span) -> IResult<Span, Toke
                         column: span.get_utf8_column() - 2,
                     },
                     LiteralKind::Binary,
+                    span.fragment().to_string(),
+                ),
+                LiteralKind::Float => Token::Literal(
+                    Location {
+                        file,
+                        line,
+                        column: span.get_utf8_column(),
+                    },
+                    LiteralKind::Float,
                     span.fragment().to_string(),
                 ),
                 LiteralKind::Decimal => Token::Literal(
@@ -810,6 +877,7 @@ fn parse_immediate_arg(file: usize, line: usize, input: Span) -> IResult<Span, T
     let (input, (kind, span)) = alt((
         |i| parse_hex_literal(i, None),
         |i| parse_binary_literal(i, None),
+        |i| parse_float_literal(i),
         |i| parse_decimal_literal(i),
         |i| parse_string_literal(i, None),
     ))
@@ -1304,6 +1372,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                 let kind_str = match kind {
                     LiteralKind::Hex => "Hex",
                     LiteralKind::Binary => "Binary",
+                    LiteralKind::Float => "Float",
                     LiteralKind::Decimal => "Decimal",
                     LiteralKind::String => "String",
                     LiteralKind::Char => "Char",
@@ -1318,6 +1387,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                             Token::Literal(_, kind, value) => match kind {
                                 LiteralKind::Hex => format!("0x{}", value),
                                 LiteralKind::Binary => format!("0b{}", value),
+                                LiteralKind::Float => value.clone(),
                                 LiteralKind::Decimal => value.clone(),
                                 LiteralKind::String => format!("\"{}\"", value),
                                 LiteralKind::Char => format!("'{}'", value),
@@ -1373,6 +1443,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                                 format!("#{}", match imm.0 {
                                     LiteralKind::Hex => format!("0x{}", imm.1),
                                     LiteralKind::Binary => format!("0b{}", imm.1),
+                                    LiteralKind::Float => imm.1.clone(),
                                     LiteralKind::Decimal => imm.1.clone(),
                                     LiteralKind::String => format!("\"{}\"", &imm.1),
                                     LiteralKind::Char => format!("'{}'", &imm.1),
@@ -1385,6 +1456,7 @@ pub fn stringify_tokens(tokens: &Vec<Token>, file_map: &[String]) -> String {
                                 format!("{}[{}]", section, match kind {
                                     LiteralKind::Hex => format!("0x{}", value),
                                     LiteralKind::Binary => format!("0b{}", value),
+                                    LiteralKind::Float => value.clone(),
                                     LiteralKind::Decimal => value.clone(),
                                     LiteralKind::String => format!("\"{}\"", value),
                                     LiteralKind::Char => format!("'{}'", value),
@@ -1455,5 +1527,36 @@ $data(meow) @ 0x1000
         let (tokens, file_map) = tokenize("file".to_string(), &src.to_string());
 
         println!("{}", stringify_tokens(&tokens, &file_map))
+    }
+
+    #[test]
+    fn test_tokenize_float_1() {
+        let src = r#"
+$data
+.D0:    0.5
+.D1:    3.14159
+.D2:    -2.71828
+.D3:    1.0e-10
+.D4:    1.0E+10
+.D5:    NaN
+.D6:    -NaN
+.D7:    0.
+.D8:    .0
+.D9:    .2e-4
+.D10:   -1.e+2
+"#;
+
+        let (tokens, file_map) = tokenize("file".to_string(), &src.to_string());
+
+        println!("{}", stringify_tokens(&tokens, &file_map));
+
+        for tok in tokens {
+            match tok {
+                Token::Section(..) | Token::Label(..) | Token::DataEntry(..) => {}
+                _ => {
+                    panic!("Unexpected token: {:?}", tok);
+                }
+            }
+        }
     }
 }

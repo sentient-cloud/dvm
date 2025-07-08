@@ -303,15 +303,6 @@ impl Object {
         }
     }
 
-    pub fn merge(mut self, other: Object) -> Self {
-        // TODO: handle collisions in everything
-        self.metadata.extend(other.metadata);
-        self.symbols.extend(other.symbols);
-        self.relocations.extend(other.relocations);
-        self.sections.extend(other.sections);
-        self
-    }
-
     pub fn from_u8_slice(data: &[u8]) -> Result<Self, ObjectError> {
         let mut res = Object {
             header: Header {

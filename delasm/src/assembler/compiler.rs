@@ -65,8 +65,7 @@ fn assemble_data_entry(
                         ))
                     })?;
                     let value_bytes = value.to_le_bytes();
-
-                    res.extend_from_slice(&value_bytes[..8]);
+                    res.extend_from_slice(&value_bytes);
                 }
                 parser::LiteralKind::Hex => {
                     if literal.len() > 16 {
@@ -85,10 +84,22 @@ fn assemble_data_entry(
                         ))
                     })?;
                     let value_bytes = value.to_le_bytes();
-                    res.extend_from_slice(&value_bytes[..8]);
+                    res.extend_from_slice(&value_bytes);
+                }
+                parser::LiteralKind::Float => {
+                    let value = literal.parse::<f64>().map_err(|_| {
+                        CompilerError::InvalidNumericLiteral(format!(
+                            "[Compilation error] @ {}: Invalid float literal: {}",
+                            loc.stringify(file_map),
+                            literal
+                        ))
+                    })?;
+
+                    let value_bytes = value.to_le_bytes();
+                    res.extend_from_slice(&value_bytes);
                 }
                 parser::LiteralKind::Decimal => {
-                    let value = literal.parse::<u64>().map_err(|_| {
+                    let value = literal.parse::<i64>().map_err(|_| {
                         CompilerError::InvalidNumericLiteral(format!(
                             "[Compilation error] @ {}: Invalid decimal literal: {}",
                             loc.stringify(file_map),
@@ -121,7 +132,7 @@ fn assemble_data_entry(
                     };
                     let ch = ch as u64;
                     let value_bytes = ch.to_le_bytes();
-                    res.extend_from_slice(&value_bytes[..8]);
+                    res.extend_from_slice(&value_bytes);
                 }
             },
             _ => {
@@ -180,6 +191,10 @@ fn assemble_immediate(
                 ))
             })
         }
+        parser::LiteralKind::Float => Err(CompilerError::InvalidOperand(format!(
+            "[Compilation error] @ {}: Float literal cannot be used as an immediate",
+            loc.stringify(file_map)
+        ))),
         parser::LiteralKind::Decimal => literal.parse::<u16>().map_err(|_| {
             CompilerError::InvalidNumericLiteral(format!(
                 "[Compilation error] @ {}: Invalid immediate decimal literal: {}",
@@ -850,15 +865,14 @@ fn assemble_instruction(
     //    lower 4 bits of c placed in the lower 4 bits
     // 2: upper 8 bits of d
     // 3: lower 8 bits of d
-    Ok((
-        vec![
-            a,
-            (b << 4) | (c & 0xF),
-            ((d >> 8) & 0xFF) as u8,
-            (d & 0xFF) as u8,
-        ],
-        relocations,
-    ))
+    let res = vec![
+        a,
+        (b << 4) | (c & 0xF),
+        ((d >> 8) & 0xFF) as u8,
+        (d & 0xFF) as u8,
+    ];
+
+    Ok((res, relocations))
 }
 
 pub fn compile_tokens(
@@ -1265,5 +1279,107 @@ $data(meow) @ 0x1000
                 println!("{:#?}", errors);
             }
         }
+    }
+
+    #[test]
+    pub fn compile_run_1() {
+        let src = r#"
+$code
+.main(export):
+    uset R1, #34
+    uadd R1, #35
+    syscall R0, R1, print_i64
+    abort #0
+"#;
+
+        let (tokens, file_map) = parser::tokenize("file".to_string(), &src.to_string());
+
+        println!("{}", src);
+        println!("{}", parser::stringify_tokens(&tokens, &file_map));
+
+        let result = compile_tokens(&tokens, &file_map).expect("compilation failed");
+
+        let mut vm = vm::DeleVM::new();
+
+        let instructions = result
+            .sections
+            .iter()
+            .find(|s| s.name.as_ref().map_or(false, |n| n == "code"))
+            .expect("no code section found")
+            .data
+            .as_slice()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<u32>>();
+
+        for (i, insn) in instructions.iter().enumerate() {
+            vm.code[i] = *insn;
+        }
+
+        vm.reset();
+
+        loop {
+            match vm.step() {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("VM Error: {:?}", err);
+                    break;
+                }
+            }
+        }
+
+        println!("{:#?}", vm.registers);
+    }
+
+    #[test]
+    fn test_compile_floats_1() {
+        let src = r#"
+$data
+.D0:    0.5
+.D1:    3.14159
+.D2:    -2.71828
+.D3:    1.0e-10
+.D4:    1.0E+10
+.D5:    NaN
+.D6:    -NaN
+.D7:    0.
+.D8:    .0
+.D9:    .2e-4
+.D10:   -1.e+2
+"#;
+
+        let (tokens, file_map) = parser::tokenize("file".to_string(), &src.to_string());
+        let result = compile_tokens(&tokens, &file_map).expect("compilation failed");
+
+        let mut vm = vm::DeleVM::new();
+
+        let instructions = result
+            .sections
+            .iter()
+            .find(|s| s.name.as_ref().map_or(false, |n| n == "code"))
+            .expect("no code section found")
+            .data
+            .as_slice()
+            .chunks_exact(4)
+            .map(|chunk| u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect::<Vec<u32>>();
+
+        for (i, insn) in instructions.iter().enumerate() {
+            vm.code[i] = *insn;
+        }
+
+        vm.reset();
+
+        loop {
+            match vm.step() {
+                Ok(_) => {}
+                Err(err) => {
+                    println!("VM Error: {:?}", err);
+                    break;
+                }
+            }
+        }
+
+        println!("{:#?}", vm.registers);
     }
 }
